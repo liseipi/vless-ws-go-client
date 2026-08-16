@@ -10,6 +10,7 @@ import (
 const (
 	vlessVer   byte = 0x00
 	cmdTCP     byte = 0x01
+	cmdUDP     byte = 0x02
 	atypIPv4   byte = 0x01
 	atypDomain byte = 0x02
 	atypIPv6   byte = 0x03
@@ -62,12 +63,12 @@ func hexVal(c byte) (byte, error) {
 // ver(1) + uuid(16) + addonsLen(1)=0 + cmd(1) + port(2,BE) + atyp(1) + addr
 //
 // addr 可以是域名、IPv4 或 IPv6 字符串，会自动选择合适的 atyp。
-func buildVlessHeader(uuid [16]byte, targetAddr string, targetPort uint16) ([]byte, error) {
+func buildVlessHeader(uuid [16]byte, cmd byte, targetAddr string, targetPort uint16) ([]byte, error) {
 	buf := &bytes.Buffer{}
 	buf.WriteByte(vlessVer)
 	buf.Write(uuid[:])
 	buf.WriteByte(0x00) // addons length = 0，服务端不解析额外字段
-	buf.WriteByte(cmdTCP)
+	buf.WriteByte(cmd)
 
 	portBytes := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBytes, targetPort)

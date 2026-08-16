@@ -54,7 +54,7 @@ func buildHTTPClient(cfg *Config) *http.Client {
 }
 
 // dialOnce 尝试建立一次 VLESS/WS 隧道，不做任何重试。
-func dialOnce(ctx context.Context, cfg *Config, uuid [16]byte, targetAddr string, targetPort uint16) (net.Conn, error) {
+func dialOnce(ctx context.Context, cfg *Config, uuid [16]byte, cmd byte, targetAddr string, targetPort uint16) (net.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.DialTimeoutMS)*time.Millisecond)
 	defer cancel()
 
@@ -78,7 +78,7 @@ func dialOnce(ctx context.Context, cfg *Config, uuid [16]byte, targetAddr string
 	// 否则 dialCtx 超时后底层连接会被取消关闭。
 	nc := websocket.NetConn(context.Background(), wsConn, websocket.MessageBinary)
 
-	hdr, err := buildVlessHeader(uuid, targetAddr, targetPort)
+	hdr, err := buildVlessHeader(uuid, cmd, targetAddr, targetPort)
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("build vless header: %w", err)
@@ -113,7 +113,7 @@ func dialOnce(ctx context.Context, cfg *Config, uuid [16]byte, targetAddr string
 	}
 }
 
-// DialVless 连接到 VLESS-WS 服务端，完成 VLESS 握手，
+// DialVless 连接到 VLESS-WS 服务端，完成 VLESS 握手（cmd=TCP），
 // 返回一个可以直接 io.Copy 的 net.Conn，读写的都是目标地址的原始 TCP 数据。
 //
 // 建立隧道失败时会按指数退避重试 cfg.ConnectRetries 次（不含首次尝试），
@@ -123,6 +123,18 @@ func dialOnce(ctx context.Context, cfg *Config, uuid [16]byte, targetAddr string
 // 强行重连只是换一条新隧道连到同一目标，对已经在传输中的数据流没有意义，
 // 交给上层应用自己重试更安全）。
 func DialVless(ctx context.Context, cfg *Config, log *Logger, uuid [16]byte, targetAddr string, targetPort uint16) (net.Conn, error) {
+	return dialVlessWithRetry(ctx, cfg, log, uuid, cmdTCP, targetAddr, targetPort)
+}
+
+// DialVlessUDP 跟 DialVless 逻辑一致，只是 cmd=UDP：服务端收到后不会建 TCP
+// 连接，而是建一个指向 targetAddr:targetPort 的 UDP socket。返回的 net.Conn
+// 上读写的不是原始字节流，而是长度前缀帧（2 字节大端长度 + UDP 包内容），
+// 一个 net.Conn 对应一个固定目标地址。
+func DialVlessUDP(ctx context.Context, cfg *Config, log *Logger, uuid [16]byte, targetAddr string, targetPort uint16) (net.Conn, error) {
+	return dialVlessWithRetry(ctx, cfg, log, uuid, cmdUDP, targetAddr, targetPort)
+}
+
+func dialVlessWithRetry(ctx context.Context, cfg *Config, log *Logger, uuid [16]byte, cmd byte, targetAddr string, targetPort uint16) (net.Conn, error) {
 	var lastErr error
 	attempts := cfg.ConnectRetries + 1
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -137,7 +149,7 @@ func DialVless(ctx context.Context, cfg *Config, log *Logger, uuid [16]byte, tar
 			}
 		}
 
-		conn, err := dialOnce(ctx, cfg, uuid, targetAddr, targetPort)
+		conn, err := dialOnce(ctx, cfg, uuid, cmd, targetAddr, targetPort)
 		if err == nil {
 			return conn, nil
 		}

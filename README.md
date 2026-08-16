@@ -23,11 +23,30 @@ vless-ws-client/
 ├── config.go      # 命令行参数 / 环境变量配置
 ├── vless.go       # VLESS 请求头编码（与服务端 vless.go 严格对应）
 ├── vlessconn.go   # WebSocket 拨号 + VLESS 握手，封装成标准 net.Conn
-├── proxy.go       # 本地监听 + 协议自动识别调度 + SOCKS5 实现
+├── proxy.go       # 本地监听 + 协议自动识别调度 + SOCKS5 实现（CONNECT）
+├── socks5udp.go   # SOCKS5 UDP ASSOCIATE 实现 + 按目标地址管理的 UDP 隧道
+├── udpframe.go    # UDP 长度前缀帧读写（跟服务端 udp.go 的帧格式对应）
 ├── http.go        # HTTP CONNECT 隧道 + 普通 HTTP 代理转发
 ├── log.go         # 分级日志，风格与服务端一致
 └── dist/          # 预编译好的各平台可执行文件，开箱即用
 ```
+
+## SOCKS5 UDP ASSOCIATE（真正的 UDP 支持）
+
+之前 SOCKS5 只实现了 CONNECT（TCP），UDP 流量（最典型的就是 DNS 查询）没法
+走这个代理，导致配合 tun2socks 这类工具做全局 VPN 时 DNS 解析不了。现在
+补上了标准的 SOCKS5 UDP ASSOCIATE：
+
+- 客户端发 UDP ASSOCIATE 命令后，会在本地开一个 UDP 端口告诉对方，之后
+  客户端把 UDP 包发到这个端口，包里带着"这个包实际要发去哪"
+- 每个不同的目标地址会各自建一条独立的 VLESS/UDP 隧道（VLESS 协议本身
+  一条连接只对应一个固定目标，跟 SOCKS5 "一个关联可以发往任意目标"的语义
+  不一样，所以需要按目标地址分开管理），同时查询多个 DNS 服务器这种场景
+  完全没问题
+- 控制用的 TCP 连接一断，这次关联涉及的所有 UDP 隧道都会跟着清理干净
+
+已经用手写的 SOCKS5 UDP 测试客户端 + UDP echo 服务器做了完整的往返测试
+（单目标、三个并发不同目标各自独立隧道两种场景），不是只编译过、没跑过。
 
 ## 构建
 
@@ -101,27 +120,29 @@ done
 
 ## 运行
 
-### 使用 dist/ 预编译文件
+### macOS 用户请先看这里
 
-`dist/` 目录下提供了各平台的可执行文件，macOS 用户首次运行前需要执行：
+从浏览器/网盘下载的可执行文件，macOS 会自动打上"隔离属性"（Gatekeeper），
+直接运行会提示"无法验证开发者"或"已损坏，无法打开"。下载后先执行：
 
 ```bash
-# 以 Apple 芯片 (arm64) 为例，Intel 芯片换成 darwin-amd64
-chmod +x dist/vless-ws-client-darwin-arm64
-xattr -d com.apple.quarantine dist/vless-ws-client-darwin-arm64
-
-# 然后直接运行
-./dist/vless-ws-client-darwin-arm64 \
-  -host your-domain.com \
-  -port 443 \
-  -path /api \
-  -uuid a3d2e1f0-b4c5-4d6e-8f70-1a2b3c4d5e6f \
-  -token 你的TOKEN
+cd 你放文件的目录
+chmod +x vless-ws-client-darwin-arm64      # Apple 芯片 (M1/M2/M3/M4)；Intel 芯片用 -amd64 那个
+xattr -d com.apple.quarantine vless-ws-client-darwin-arm64
 ```
 
-Linux 和 Windows 用户不需要 `xattr` 步骤，`chmod +x` 后直接运行即可。
+这两行做完之后就能正常运行了。
 
-### 自行构建后运行
+**如果运行时报 `tls: failed to verify certificate: SecPolicyCreateSSL error: 0`**：
+这是 Go 语言在 macOS 上一个已知问题（调用系统证书校验服务 Security.framework
+在某些进程环境下会失败），常见诱因是**同时开着其他系统代理/VPN**干扰了系统证书
+校验服务本身的网络请求（比如吊销状态检查）。遇到时可以先试试：
+
+- 关掉其他正在运行的代理/VPN 再试一次
+- 或者临时加上 `-insecure` 参数跳过证书校验（能连通就说明确实是这个问题，
+  但生产环境不建议一直开着这个参数）
+
+### 通用运行方式
 
 ```bash
 ./vless-ws-client \
@@ -204,11 +225,15 @@ LOCAL_PORT=1080 \
 
 - 完整握手 + SOCKS5 CONNECT + WebSocket 转发 + 目标 HTTP 响应往返
 - 同一端口下 HTTP CONNECT（HTTPS 隧道）与普通 HTTP 代理转发均测试通过
+- **SOCKS5 UDP ASSOCIATE**：手写测试客户端模拟真实 SOCKS5 UDP 流程（握手 →
+  UDP ASSOCIATE → 发包 → 收包），配合 UDP echo 服务器验证单目标和多目标
+  并发两种场景，往返数据完全一致
 - Token 校验、`go vet` 静态检查通过
 
 ## 注意事项
 
-- SOCKS5 部分只实现了 `CONNECT` 命令（网页浏览、大多数应用够用），不支持 `BIND` / `UDP ASSOCIATE`。
+- SOCKS5 支持 `CONNECT`（TCP）和 `UDP ASSOCIATE`（UDP）两种命令，不支持 `BIND`
+  （这个命令用得很少，主流工具基本不需要）。
 - 普通（非 CONNECT）HTTP 代理转发为简化实现，每条连接只转发一个请求（强制 `Connection: close`），
   覆盖 `curl -x` 等基本场景；HTTPS 站点走的是 `CONNECT` 隧道，不受此限制，长连接、多请求都没问题。
 - 每个代理连接对应一条独立的 WebSocket 连接（与服务端 `session.go` 的单连接单会话模型一致），

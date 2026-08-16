@@ -57,7 +57,7 @@ func LoadConfig() *Config {
 	cfg := &Config{}
 
 	flag.StringVar(&cfg.ServerHost, "host", envStr("SERVER_HOST", ""), "服务器地址（域名或 IP），不要带 ws:// 或 wss://，例如 example.com")
-	flag.StringVar(&cfg.ServerPort, "port", envStr("SERVER_PORT", "8443"), "服务器端口，例如 443")
+	flag.StringVar(&cfg.ServerPort, "port", envStr("SERVER_PORT", "443"), "服务器端口，例如 443")
 	flag.StringVar(&cfg.WSPath, "path", envStr("WS_PATH", "/api"), "连接路径，需与服务端 WS_PATH 一致，例如 /api")
 	flag.BoolVar(&cfg.UseTLS, "tls", envBool("USE_TLS", true), "是否使用 TLS（wss://）。裸端口直连测试时可设为 false")
 

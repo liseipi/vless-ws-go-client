@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -12,14 +14,15 @@ import (
 )
 
 const (
-	socksVer5      byte = 0x05
-	socksCmdConn   byte = 0x01
-	socksAtypIPv4  byte = 0x01
-	socksAtypDom   byte = 0x03
-	socksAtypIPv6  byte = 0x04
-	socksRepOK     byte = 0x00
-	socksRepFail   byte = 0x01
-	socksRepCmdErr byte = 0x07
+	socksVer5        byte = 0x05
+	socksCmdConn     byte = 0x01
+	socksCmdUDPAssoc byte = 0x03
+	socksAtypIPv4    byte = 0x01
+	socksAtypDom     byte = 0x03
+	socksAtypIPv6    byte = 0x04
+	socksRepOK       byte = 0x00
+	socksRepFail     byte = 0x01
+	socksRepCmdErr   byte = 0x07
 )
 
 // ProxyServer 在同一个本地端口上同时提供 SOCKS5 和 HTTP(S) 代理服务，
@@ -89,9 +92,14 @@ func (s *ProxyServer) handleSocks5(cid string, conn net.Conn, br *bufio.Reader) 
 		return
 	}
 
-	targetAddr, targetPort, err := s.socks5ReadRequest(br, conn)
+	cmd, targetAddr, targetPort, err := s.socks5ReadRequest(br, conn)
 	if err != nil {
 		s.log.Debug(fmt.Sprintf("[%s] socks5 request: %s", cid, err.Error()))
+		return
+	}
+
+	if cmd == socksCmdUDPAssoc {
+		s.handleSocks5UDPAssociate(cid, conn, br)
 		return
 	}
 
@@ -137,18 +145,19 @@ func (s *ProxyServer) socks5Handshake(br *bufio.Reader, conn net.Conn) error {
 	return nil
 }
 
-// socks5ReadRequest 解析 SOCKS5 CONNECT 请求，返回目标地址与端口。
-func (s *ProxyServer) socks5ReadRequest(br *bufio.Reader, conn net.Conn) (string, uint16, error) {
+// socks5ReadRequest 解析 SOCKS5 请求，返回命令类型、目标地址与端口。
+func (s *ProxyServer) socks5ReadRequest(br *bufio.Reader, conn net.Conn) (byte, string, uint16, error) {
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(br, head); err != nil {
-		return "", 0, err
+		return 0, "", 0, err
 	}
 	if head[0] != socksVer5 {
-		return "", 0, fmt.Errorf("bad version 0x%02x", head[0])
+		return 0, "", 0, fmt.Errorf("bad version 0x%02x", head[0])
 	}
-	if head[1] != socksCmdConn {
+	cmd := head[1]
+	if cmd != socksCmdConn && cmd != socksCmdUDPAssoc {
 		s.socks5Reply(conn, socksRepCmdErr)
-		return "", 0, fmt.Errorf("unsupported command 0x%02x (only CONNECT is supported)", head[1])
+		return 0, "", 0, fmt.Errorf("unsupported command 0x%02x (只支持 CONNECT 和 UDP ASSOCIATE)", cmd)
 	}
 
 	var addr string
@@ -156,37 +165,37 @@ func (s *ProxyServer) socks5ReadRequest(br *bufio.Reader, conn net.Conn) (string
 	case socksAtypIPv4:
 		b := make([]byte, 4)
 		if _, err := io.ReadFull(br, b); err != nil {
-			return "", 0, err
+			return 0, "", 0, err
 		}
 		addr = net.IP(b).String()
 	case socksAtypDom:
 		lb := make([]byte, 1)
 		if _, err := io.ReadFull(br, lb); err != nil {
-			return "", 0, err
+			return 0, "", 0, err
 		}
 		b := make([]byte, int(lb[0]))
 		if _, err := io.ReadFull(br, b); err != nil {
-			return "", 0, err
+			return 0, "", 0, err
 		}
 		addr = string(b)
 	case socksAtypIPv6:
 		b := make([]byte, 16)
 		if _, err := io.ReadFull(br, b); err != nil {
-			return "", 0, err
+			return 0, "", 0, err
 		}
 		addr = net.IP(b).String()
 	default:
 		s.socks5Reply(conn, socksRepCmdErr)
-		return "", 0, fmt.Errorf("unsupported atyp 0x%02x", head[3])
+		return 0, "", 0, fmt.Errorf("unsupported atyp 0x%02x", head[3])
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(br, portBuf); err != nil {
-		return "", 0, err
+		return 0, "", 0, err
 	}
 	port := uint16(portBuf[0])<<8 | uint16(portBuf[1])
 
-	return addr, port, nil
+	return cmd, addr, port, nil
 }
 
 func (s *ProxyServer) socks5Reply(conn net.Conn, rep byte) error {
@@ -194,6 +203,28 @@ func (s *ProxyServer) socks5Reply(conn net.Conn, rep byte) error {
 	// 绝大多数客户端（浏览器、curl、系统代理）都不校验这两个字段。
 	reply := []byte{socksVer5, rep, 0x00, socksAtypIPv4, 0, 0, 0, 0, 0, 0}
 	_, err := conn.Write(reply)
+	return err
+}
+
+// socks5ReplyWithAddr 跟 socks5Reply 类似，但可以指定 BND.ADDR/BND.PORT——
+// UDP ASSOCIATE 必须靠这两个字段告诉客户端"UDP 包实际发去哪个地址/端口"。
+func (s *ProxyServer) socks5ReplyWithAddr(conn net.Conn, rep byte, addr *net.UDPAddr) error {
+	buf := &bytes.Buffer{}
+	buf.WriteByte(socksVer5)
+	buf.WriteByte(rep)
+	buf.WriteByte(0x00)
+	ip4 := addr.IP.To4()
+	if ip4 != nil {
+		buf.WriteByte(socksAtypIPv4)
+		buf.Write(ip4)
+	} else {
+		buf.WriteByte(socksAtypIPv6)
+		buf.Write(addr.IP.To16())
+	}
+	portBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBuf, uint16(addr.Port))
+	buf.Write(portBuf)
+	_, err := conn.Write(buf.Bytes())
 	return err
 }
 
