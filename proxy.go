@@ -30,13 +30,14 @@ const (
 //   - 0x05          -> SOCKS5
 //   - 其余（ASCII）  -> HTTP 请求行（CONNECT 或普通 GET/POST 等）
 type ProxyServer struct {
-	cfg  *Config
-	log  *Logger
-	uuid [16]byte
+	cfg     *Config
+	log     *Logger
+	uuid    [16]byte
+	sessMgr *sessionManager // 复用底层 WS+yamux 会话，多个逻辑连接共享同一条已握手的连接
 }
 
 func NewProxyServer(cfg *Config, log *Logger, uuid [16]byte) *ProxyServer {
-	return &ProxyServer{cfg: cfg, log: log, uuid: uuid}
+	return &ProxyServer{cfg: cfg, log: log, uuid: uuid, sessMgr: newSessionManager(cfg, log)}
 }
 
 func newConnID() string {
@@ -108,7 +109,7 @@ func (s *ProxyServer) handleSocks5(cid string, conn net.Conn, br *bufio.Reader) 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	upstream, err := DialVless(ctx, s.cfg, s.log, s.uuid, targetAddr, targetPort)
+	upstream, err := DialVless(ctx, s.sessMgr, s.log, s.uuid, targetAddr, targetPort)
 	if err != nil {
 		s.log.Warn(fmt.Sprintf("[%s] connect upstream %s:%d failed: %s", cid, targetAddr, targetPort, err.Error()))
 		s.socks5Reply(conn, socksRepFail)

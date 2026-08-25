@@ -42,7 +42,7 @@ func (s *ProxyServer) handleHTTPConnect(cid string, conn net.Conn, br *bufio.Rea
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	upstream, err := DialVless(ctx, s.cfg, s.log, s.uuid, targetAddr, targetPort)
+	upstream, err := DialVless(ctx, s.sessMgr, s.log, s.uuid, targetAddr, targetPort)
 	if err != nil {
 		s.log.Warn(fmt.Sprintf("[%s] connect upstream %s:%d failed: %s", cid, targetAddr, targetPort, err.Error()))
 		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -78,7 +78,7 @@ func (s *ProxyServer) handlePlainHTTP(cid string, conn net.Conn, req *http.Reque
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	upstream, err := DialVless(ctx, s.cfg, s.log, s.uuid, targetAddr, targetPort)
+	upstream, err := DialVless(ctx, s.sessMgr, s.log, s.uuid, targetAddr, targetPort)
 	if err != nil {
 		s.log.Warn(fmt.Sprintf("[%s] connect upstream %s:%d failed: %s", cid, targetAddr, targetPort, err.Error()))
 		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")

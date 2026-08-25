@@ -139,7 +139,7 @@ func (s *ProxyServer) handleSocks5UDPAssociate(cid string, ctrlConn net.Conn, br
 		mu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.DialTimeoutMS)*time.Millisecond)
-		conn, err := DialVlessUDP(ctx, s.cfg, s.log, s.uuid, destAddr, destPort)
+		conn, err := DialVlessUDP(ctx, s.sessMgr, s.log, s.uuid, destAddr, destPort)
 		cancel()
 		if err != nil {
 			return nil, err
