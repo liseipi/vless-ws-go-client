@@ -104,6 +104,15 @@ func (m *sessionManager) dialSession(ctx context.Context) (*yamux.Session, error
 		ymCfg.KeepAliveInterval = ka
 	}
 	ymCfg.ConnectionWriteTimeout = 15 * time.Second
+	// yamux 默认单流窗口只有 256KB，会严重限制单个 stream（比如一次大文件
+	// 下载/上传）的吞吐量：发送方发满 256KB 未确认数据就必须停下来等对端
+	// 的窗口更新包，相当于每 256KB 就插入一次往返等待，RTT 越高影响越大。
+	// 这里换成更大的窗口（默认 16MB，可用 -yamux-window-kb 调整），
+	// 需要和服务端的 YAMUX_WINDOW_KB 保持同一数量级，两边独立配置，
+	// 不要求完全相等（yamux 两端各自声明自己的接收窗口）。
+	if cfg.YamuxWindowBytes > 0 {
+		ymCfg.MaxStreamWindowSize = cfg.YamuxWindowBytes
+	}
 
 	sess, err := yamux.Client(nc, ymCfg)
 	if err != nil {

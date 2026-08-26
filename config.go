@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 )
 
 // Config 保存客户端全部运行时配置。
@@ -24,14 +25,15 @@ type Config struct {
 	LocalIP   string // 本地监听 IP，例如 127.0.0.1（只在本机使用）或 0.0.0.0（局域网共享，请谨慎）
 	LocalPort string // 本地监听端口，SOCKS5 与 HTTP(S) 代理共用同一端口，自动识别协议
 
-	UUID          string
-	Token         string
-	DialTimeoutMS int64
-	ConnectRetries int   // 建立 VLESS/WS 隧道失败时的额外重试次数（不含首次尝试）
-	RetryBaseMs    int64 // 重试退避基准时间（毫秒），指数增长：base, base*2, base*4...
-	KeepAliveSec   int   // TCP KeepAlive 探测间隔（秒），0 表示关闭
-	Insecure       bool  // 跳过 TLS 证书校验（自签名证书时使用，生产环境不建议）
-	LogLevel       string
+	UUID             string
+	Token            string
+	DialTimeoutMS    int64
+	ConnectRetries   int   // 建立 VLESS/WS 隧道失败时的额外重试次数（不含首次尝试）
+	RetryBaseMs      int64 // 重试退避基准时间（毫秒），指数增长：base, base*2, base*4...
+	KeepAliveSec     int   // TCP KeepAlive 探测间隔（秒），0 表示关闭
+	Insecure         bool  // 跳过 TLS 证书校验（自签名证书时使用，生产环境不建议）
+	LogLevel         string
+	YamuxWindowBytes uint32 // 单个 yamux stream 的接收窗口大小，见 sessionpool.go 里的说明
 }
 
 func envStr(key, def string) string {
@@ -51,6 +53,15 @@ func envBool(key string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+func envInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 func LoadConfig() *Config {
@@ -75,7 +86,10 @@ func LoadConfig() *Config {
 	flag.IntVar(&cfg.KeepAliveSec, "keepalive-sec", 30, "TCP KeepAlive 探测间隔（秒），0 表示关闭")
 	flag.BoolVar(&cfg.Insecure, "insecure", envBool("INSECURE", false), "跳过 TLS 证书校验（自签名证书调试用）")
 	flag.StringVar(&cfg.LogLevel, "log-level", envStr("LOG_LEVEL", "info"), "日志级别：debug/info/warn/error")
+	var yamuxWindowKB int64
+	flag.Int64Var(&yamuxWindowKB, "yamux-window-kb", int64(envInt64("YAMUX_WINDOW_KB", 16*1024)), "单个逻辑连接的 yamux 接收窗口大小（KB），需与服务端 YAMUX_WINDOW_KB 保持数量级一致；调大能提升大文件传输吞吐，但会增加内存占用")
 	flag.Parse()
+	cfg.YamuxWindowBytes = uint32(yamuxWindowKB) * 1024
 
 	if cfg.ServerHost == "" || cfg.UUID == "" {
 		fmt.Fprintln(os.Stderr, "错误: 必须提供 -host 和 -uuid（或环境变量 SERVER_HOST / UUID）")

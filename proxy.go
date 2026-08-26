@@ -230,14 +230,24 @@ func (s *ProxyServer) socks5ReplyWithAddr(conn net.Conn, rep byte, addr *net.UDP
 }
 
 // relay 在客户端连接与上游隧道之间做双向转发，任一方向结束后
-// 关闭上游连接以驱动另一方向尽快退出，并等待两个方向都结束，避免 goroutine 泄漏。
-func relay(clientReader io.Reader, clientWriter io.Writer, upstream io.ReadWriteCloser) {
+// 同时关闭本地连接和上游连接，驱动另一方向尽快退出，并等待两个方向都结束，
+// 避免 goroutine 泄漏。
+//
+// 两个方向都要主动关闭 clientConn 和 upstream 这两端，而不是只关 upstream：
+// 如果只关 upstream，遇到"客户端只读不写"的场景（比如下载一个大文件，读完
+// 就不再发送任何数据，也不会自己关闭连接——这在很多真实客户端里会很快
+// 发生，因为它们检测到对端 EOF 后通常会主动关闭，但不能保证所有客户端都
+// 这样做）时，上传方向的 io.Copy 会永远阻塞在读本地连接上，导致本函数永远
+// 不返回、连接永远不释放。
+func relay(clientReader io.Reader, clientConn net.Conn, upstream io.ReadWriteCloser) {
 	errCh := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(upstream, clientReader)
+		_ = clientConn.Close() // 半方向结束也直接关本地连接，驱动下载方向尽快退出
 		errCh <- err
 	}()
-	_, _ = io.Copy(clientWriter, upstream)
+	_, _ = io.Copy(clientConn, upstream)
 	_ = upstream.Close()
+	_ = clientConn.Close()
 	<-errCh
 }
