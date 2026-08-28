@@ -45,6 +45,10 @@ API_LEVEL=21
 OUT_DIR="dist-android"
 mkdir -p "$OUT_DIR"
 
+# 跟 build-dist.sh / run-client.sh 保持一致：编译前先 tidy 一遍依赖。
+echo "==> go mod tidy"
+go mod tidy
+
 LDFLAGS="-s -w"
 
 echo "==> building android/arm64 (arm64-v8a)"
