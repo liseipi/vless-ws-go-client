@@ -128,16 +128,21 @@ func (m *sessionManager) dialSession(ctx context.Context) (*yamux.Session, error
 //     这样 TCP 连接目标（ServerHost）和 TLS SNI / HTTP Host 头（EffectiveSNI/EffectiveWSHost）
 //     就彻底解耦了：可以直连 IP，同时仍然发送期望的 SNI/Host，默认配置下三者一致，行为不变。
 //   - 显式开启 TCP KeepAlive，长时间空闲的隧道不容易被 NAT/防火墙判定为死连接而丢弃。
+//   - 域名同时有 A/AAAA 记录时，用 dialPreferIPv6 代替 Go 默认的 Happy
+//     Eyeballs，见该函数注释里的说明。
 func buildHTTPClient(cfg *Config) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   time.Duration(cfg.DialTimeoutMS) * time.Millisecond,
 		KeepAlive: time.Duration(cfg.KeepAliveSec) * time.Second,
 	}
-	realAddr := net.JoinHostPort(cfg.ServerHost, cfg.ServerPort)
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, network, realAddr)
+			if !cfg.PreferIPv6 {
+				return dialer.DialContext(ctx, network, net.JoinHostPort(cfg.ServerHost, cfg.ServerPort))
+			}
+			delay := time.Duration(cfg.IPv4FallbackDelayMS) * time.Millisecond
+			return dialPreferIPv6(ctx, dialer, cfg.ServerHost, cfg.ServerPort, delay)
 		},
 		TLSClientConfig: &tls.Config{
 			ServerName:         cfg.EffectiveSNI(),
@@ -145,4 +150,102 @@ func buildHTTPClient(cfg *Config) *http.Client {
 		},
 	}
 	return &http.Client{Transport: transport}
+}
+
+// dialPreferIPv6 针对"域名同时有 IPv4/IPv6 记录、但两条路径质量差异很大"
+// 的场景，实现一个明确偏向 IPv6 的拨号策略：
+//
+//   - IPv6 立即开始拨号；
+//   - IPv4 默认延迟 ipv4FallbackDelay（比如 100ms）之后才作为"兜底"启动，
+//     如果 IPv6 在这之前已经失败，则不用等满这个延迟，立刻启动 IPv4；
+//   - 两边谁先握手成功就用谁，另一边仍在进行中的拨号会被取消。
+//
+// 这跟 Go net.Dialer 内置的 Happy Eyeballs（RFC 6555 Fast Fallback）不是一回事：
+// Go 默认实现只关心"谁的 TCP 握手先完成"，两个地址族的拨号几乎同时开始，
+// 完全不偏向哪一边。但握手成功不代表这条路径质量好——比如某些 CDN/网络
+// 环境下，IPv4 路径握手（SYN/SYN-ACK）经常能很快通过，只是后续实际数据
+// 传输被限速或不稳定；这种情况下 Go 的默认策略会经常"赌"到握手快但传输
+// 差的 IPv4 上。显式让 IPv6 抢跑、IPv4 仅作延迟兜底，能大幅降低落到差
+// 路径上的概率，同时保留"IPv6 真的不通时能尽快切回 IPv4"的兜底能力。
+//
+// 如果域名解析出来只有一种地址族，直接拨那个族，不存在"比较"的问题。
+func dialPreferIPv6(ctx context.Context, dialer *net.Dialer, host, port string, ipv4FallbackDelay time.Duration) (net.Conn, error) {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", host, err)
+	}
+
+	var v6addrs, v4addrs []net.IPAddr
+	for _, ip := range ips {
+		if ip.IP.To4() == nil {
+			v6addrs = append(v6addrs, ip)
+		} else {
+			v4addrs = append(v4addrs, ip)
+		}
+	}
+
+	switch {
+	case len(v6addrs) == 0 && len(v4addrs) == 0:
+		return nil, fmt.Errorf("resolve %s: no A/AAAA records", host)
+	case len(v6addrs) == 0:
+		return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(v4addrs[0].IP.String(), port))
+	case len(v4addrs) == 0:
+		return dialer.DialContext(ctx, "tcp6", net.JoinHostPort(v6addrs[0].IP.String(), port))
+	}
+
+	// 双栈都有：v6 立即拨号；v4 延迟 ipv4FallbackDelay 后兜底启动，
+	// v6 提前失败时不用等满延迟，立刻触发 v4。谁先连通用谁，函数返回时
+	// 通过取消 raceCtx 让另一路还没完成的拨号自行终止。
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	v6FailedCh := make(chan struct{})
+	resCh := make(chan result, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c, err := dialer.DialContext(raceCtx, "tcp6", net.JoinHostPort(v6addrs[0].IP.String(), port))
+		if err != nil {
+			close(v6FailedCh)
+		}
+		resCh <- result{c, err}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		select {
+		case <-raceCtx.Done():
+			resCh <- result{nil, raceCtx.Err()}
+			return
+		case <-v6FailedCh:
+			// v6 已经先失败了，不用再等延迟，立刻启动 v4 兜底
+		case <-time.After(ipv4FallbackDelay):
+		}
+		c, err := dialer.DialContext(raceCtx, "tcp4", net.JoinHostPort(v4addrs[0].IP.String(), port))
+		resCh <- result{c, err}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
+	var firstErr error
+	for r := range resCh {
+		if r.err == nil {
+			return r.conn, nil
+		}
+		if firstErr == nil {
+			firstErr = r.err
+		}
+	}
+	return nil, firstErr
 }

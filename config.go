@@ -34,6 +34,10 @@ type Config struct {
 	Insecure         bool  // 跳过 TLS 证书校验（自签名证书时使用，生产环境不建议）
 	LogLevel         string
 	YamuxWindowBytes uint32 // 单个 yamux stream 的接收窗口大小，见 sessionpool.go 里的说明
+
+	// 域名解析出双栈地址时的拨号策略，见 sessionpool.go 里 dialPreferIPv6 的说明。
+	PreferIPv6          bool // true：v6 立即拨号，v4 延迟兜底；false：退回 Go 默认的 Happy Eyeballs
+	IPv4FallbackDelayMS int  // v6 拨号多久之后才开始尝试 v4（v6 提前失败时不受此限制，立刻兜底）
 }
 
 func envStr(key, def string) string {
@@ -87,7 +91,9 @@ func LoadConfig() *Config {
 	flag.BoolVar(&cfg.Insecure, "insecure", envBool("INSECURE", false), "跳过 TLS 证书校验（自签名证书调试用）")
 	flag.StringVar(&cfg.LogLevel, "log-level", envStr("LOG_LEVEL", "info"), "日志级别：debug/info/warn/error")
 	var yamuxWindowKB int64
-	flag.Int64Var(&yamuxWindowKB, "yamux-window-kb", int64(envInt64("YAMUX_WINDOW_KB", 16*1024)), "单个逻辑连接的 yamux 接收窗口大小（KB），需与服务端 YAMUX_WINDOW_KB 保持数量级一致；调大能提升大文件传输吞吐，但会增加内存占用")
+	flag.Int64Var(&yamuxWindowKB, "yamux-window-kb", int64(envInt64("YAMUX_WINDOW_KB", 20*1024)), "单个逻辑连接的 yamux 接收窗口大小（KB），需与服务端 YAMUX_WINDOW_KB 保持数量级一致；调大能提升大文件传输吞吐，但会增加内存占用")
+	flag.BoolVar(&cfg.PreferIPv6, "prefer-ipv6", envBool("PREFER_IPV6", true), "域名双栈解析时优先走 IPv6，IPv4 延迟兜底；设为 false 退回 Go 默认的 Happy Eyeballs")
+	flag.IntVar(&cfg.IPv4FallbackDelayMS, "ipv4-fallback-delay-ms", int(envInt64("IPV4_FALLBACK_DELAY_MS", 100)), "IPv6 拨号多久后才尝试 IPv4 兜底（毫秒），IPv6 提前失败时不受此限制、立刻兜底")
 	flag.Parse()
 	cfg.YamuxWindowBytes = uint32(yamuxWindowKB) * 1024
 
