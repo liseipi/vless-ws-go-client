@@ -8,10 +8,20 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
+)
+
+// protocolMode 表示当前判断/配置的服务端协议兼容模式。
+type protocolMode int32
+
+const (
+	modeUnknown protocolMode = iota // 还没探测过，第一次用会触发一次探测
+	modeYamux                       // 服务端支持本项目的 WS+yamux 连接复用协议
+	modeLegacy                      // 服务端是标准 VLESS-WS（比如 Xray-core 原生实现、CF 后面常见部署），不认识 yamux 封装
 )
 
 // sessionManager 维护一条到服务端的底层 WS+yamux 会话。
@@ -27,16 +37,50 @@ import (
 //
 // 一个 stream 出错或被关闭只影响这一路转发，不会影响同一会话上的其它请求，
 // 也不会导致底层 WS 连接被误关闭。
+//
+// 但 WS+yamux 是本项目自己加的私有封装，标准的 VLESS-WS 服务端完全不认识
+// 这层东西——sessionManager 同时负责"服务端到底支不支持"这件事的自动判断
+// 与缓存，具体探测逻辑在 vlessconn.go 的 dialWithProtocolDetection 里。
 type sessionManager struct {
 	cfg *Config
 	log *Logger
 
 	mu      sync.Mutex
 	current *yamux.Session
+
+	mode    int32      // protocolMode，原子读写
+	probeMu sync.Mutex // 保证同一时刻只有一个 goroutine 在做首次探测，其余的等它探测完直接复用结果
 }
 
 func newSessionManager(cfg *Config, log *Logger) *sessionManager {
-	return &sessionManager{cfg: cfg, log: log}
+	sm := &sessionManager{cfg: cfg, log: log}
+	switch cfg.YamuxMode {
+	case "yamux":
+		sm.mode = int32(modeYamux)
+	case "legacy":
+		sm.mode = int32(modeLegacy)
+	default: // "auto"
+		sm.mode = int32(modeUnknown)
+	}
+	return sm
+}
+
+func (m *sessionManager) getMode() protocolMode {
+	return protocolMode(atomic.LoadInt32(&m.mode))
+}
+
+// setModeAndCleanup 切换协议模式；切到 legacy 时顺带关掉可能已经建立起来、
+// 但对标准服务端毫无意义的 yamux 会话，避免残留一条没人用的连接。
+func (m *sessionManager) setModeAndCleanup(mode protocolMode) {
+	if mode == modeLegacy {
+		m.mu.Lock()
+		if m.current != nil {
+			_ = m.current.Close()
+			m.current = nil
+		}
+		m.mu.Unlock()
+	}
+	atomic.StoreInt32(&m.mode, int32(mode))
 }
 
 // openStream 返回一个可用于收发一次 VLESS 请求的 stream：
@@ -123,7 +167,36 @@ func (m *sessionManager) dialSession(ctx context.Context) (*yamux.Session, error
 	return sess, nil
 }
 
-// buildHTTPClient 构造用于 WebSocket 握手的 http.Client：
+// dialLegacyWS 走一次完整的 TCP + TLS + WS Upgrade 握手，返回原始的 WS
+// NetConn，不做任何 yamux 封装——这是本项目最早的实现方式，用于兼容标准
+// VLESS-WS 服务端（不认识 yamux 这层私有协议）。每次调用都会真正新建一条
+// WS 连接，一个连接只服务一次逻辑请求，用完即关闭，见 vlessconn.go 里的
+// dialVlessLegacyOnce。
+func dialLegacyWS(ctx context.Context, cfg *Config) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.DialTimeoutMS)*time.Millisecond)
+	defer cancel()
+
+	httpClient := buildHTTPClient(cfg)
+	header := make(http.Header)
+	if cfg.Token != "" {
+		header.Set("X-Auth-Token", cfg.Token)
+	}
+	opts := &websocket.DialOptions{
+		HTTPClient: httpClient,
+		HTTPHeader: header,
+	}
+
+	wsConn, _, err := websocket.Dial(dialCtx, cfg.DialURL(), opts)
+	if err != nil {
+		return nil, fmt.Errorf("websocket dial: %w", err)
+	}
+	wsConn.SetReadLimit(-1)
+
+	// 用 background ctx（而非 dialCtx）构造长连接的 net.Conn，
+	// 否则 dialCtx 超时后底层连接会被取消关闭。
+	return websocket.NetConn(context.Background(), wsConn, websocket.MessageBinary), nil
+}
+
 //   - DialContext 固定拨号到 cfg.ServerHost:cfg.ServerPort，忽略 addr 参数里的 host。
 //     这样 TCP 连接目标（ServerHost）和 TLS SNI / HTTP Host 头（EffectiveSNI/EffectiveWSHost）
 //     就彻底解耦了：可以直连 IP，同时仍然发送期望的 SNI/Host，默认配置下三者一致，行为不变。
