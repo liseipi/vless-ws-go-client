@@ -46,6 +46,13 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o "${OUT_DIR
 echo "==> building windows/amd64 -> ${OUT_DIR}/vless-ws-client-windows-amd64.exe (cgo disabled，跨 OS 交叉编译)"
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o "${OUT_DIR}/vless-ws-client-windows-amd64.exe" .
 
+# windows/arm64：Go 1.17+ 原生支持，纯 Go 实现（Windows 下网络/DNS 走的是
+# Winsock API，不像 macOS 那样依赖 cgo 才能拿到系统解析规则），所以跟
+# linux 那两个目标一样关闭 cgo、加同样的 ldflags 即可，不需要额外工具链。
+# 对应骁龙/ARM Windows 笔记本（如 Surface Pro X 系列、部分 ARM 版 ThinkPad）。
+echo "==> building windows/arm64 -> ${OUT_DIR}/vless-ws-client-windows-arm64.exe (cgo disabled，跨 OS 交叉编译)"
+GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o "${OUT_DIR}/vless-ws-client-windows-arm64.exe" .
+
 echo ""
 echo "全部完成，产物在 ${OUT_DIR}/ 目录下："
 ls -la "$OUT_DIR"
