@@ -46,6 +46,12 @@ type Config struct {
 	// "legacy" 跳过探测。见 vlessconn.go 里的说明。
 	YamuxMode      string // "auto" | "yamux" | "legacy"
 	ProbeTimeoutMS int64  // 首次自动探测时，等待 VLESS 响应的超时时间（毫秒），仅在 auto 模式下、且探测尚未完成时使用
+
+	EnableTun bool   // 是否启用 tun 模式
+	TunName   string // tun 网卡名，Linux/macOS 建议 utun/tun 前缀，Windows 下是显示名
+	TunMTU    int    // tun 网卡 MTU
+	TunAddr4  string // 分配给 tun 网卡的 IPv4 地址，例如 198.18.0.1
+	TunAddr6  string // 分配给 tun 网卡的 IPv6 地址，留空则不启用 IPv6
 }
 
 func envStr(key, def string) string {
@@ -104,6 +110,11 @@ func LoadConfig() *Config {
 	flag.IntVar(&cfg.IPv4FallbackDelayMS, "ipv4-fallback-delay-ms", int(envInt64("IPV4_FALLBACK_DELAY_MS", 100)), "IPv6 拨号多久后才尝试 IPv4 兜底（毫秒），IPv6 提前失败时不受此限制、立刻兜底")
 	flag.StringVar(&cfg.YamuxMode, "yamux-mode", envStr("YAMUX_MODE", "auto"), "服务端是否支持本项目的 WS+yamux 连接复用协议：auto（首次自动探测并记住结果，默认）/ yamux（强制开启，标准 VLESS-WS 服务端会连不上）/ legacy（强制关闭，退回一个 WS 连接对应一次请求，兼容任意标准 VLESS-WS 服务端）")
 	flag.Int64Var(&cfg.ProbeTimeoutMS, "probe-timeout-ms", envInt64("PROBE_TIMEOUT_MS", 6000), "auto 模式下首次探测服务端是否支持连接复用协议时的超时时间（毫秒），超时未收到有效响应就判定为不支持，自动切换为兼容模式")
+	flag.BoolVar(&cfg.EnableTun, "tun", envBool("ENABLE_TUN", false), "启用 tun 模式（系统级透明代理），需要管理员/root 权限创建虚拟网卡")
+	flag.StringVar(&cfg.TunName, "tun-name", envStr("TUN_NAME", "utun233"), "tun 网卡名，Linux 下建议 tun0，macOS 下必须是 utunN 格式，Windows 下随意")
+	flag.IntVar(&cfg.TunMTU, "tun-mtu", int(envInt64("TUN_MTU", 1500)), "tun 网卡 MTU")
+	flag.StringVar(&cfg.TunAddr4, "tun-addr4", envStr("TUN_ADDR4", "198.18.0.1"), "分配给 tun 网卡的 IPv4 地址")
+	flag.StringVar(&cfg.TunAddr6, "tun-addr6", envStr("TUN_ADDR6", ""), "分配给 tun 网卡的 IPv6 地址，留空则不配置 IPv6")
 	flag.Parse()
 	cfg.YamuxWindowBytes = uint32(yamuxWindowKB) * 1024
 

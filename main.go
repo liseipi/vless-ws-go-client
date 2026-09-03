@@ -18,6 +18,15 @@ func main() {
 
 	printBanner(cfg)
 
+	if cfg.EnableTun {
+		tunSrv := NewTunServer(cfg, log, uuidBytes)
+		if err := tunSrv.ListenAndServe(); err != nil {
+			log.Error("fatal:", err.Error())
+			os.Exit(1)
+		}
+		return
+	}
+
 	srv := NewProxyServer(cfg, log, uuidBytes)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Error("fatal:", err.Error())
@@ -44,7 +53,11 @@ func printBanner(cfg *Config) {
 		tokState = "enabled"
 	}
 	fmt.Println(row(fmt.Sprintf("Token    : %s", tokState)))
-	fmt.Println(row(fmt.Sprintf("Local    : %s (SOCKS5 + HTTP(S) 共用端口)", cfg.ListenAddr())))
+	if cfg.EnableTun {
+		fmt.Println(row(fmt.Sprintf("Mode     : TUN (网卡 %s, 地址 %s)", cfg.TunName, cfg.TunAddr4)))
+	} else {
+		fmt.Println(row(fmt.Sprintf("Local    : %s (SOCKS5 + HTTP(S) 共用端口)", cfg.ListenAddr())))
+	}
 	if cfg.SNI != "" || cfg.WSHost != "" {
 		fmt.Println(row(fmt.Sprintf("SNI      : %s", cfg.EffectiveSNI())))
 		fmt.Println(row(fmt.Sprintf("WS Host  : %s", cfg.EffectiveWSHost())))
