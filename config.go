@@ -110,7 +110,7 @@ func LoadConfig() *Config {
 	flag.BoolVar(&cfg.Insecure, "insecure", envBool("INSECURE", false), "跳过 TLS 证书校验（自签名证书调试用）")
 	flag.StringVar(&cfg.LogLevel, "log-level", envStr("LOG_LEVEL", "info"), "日志级别：debug/info/warn/error")
 	var yamuxWindowKB int64
-	flag.Int64Var(&yamuxWindowKB, "yamux-window-kb", int64(envInt64("YAMUX_WINDOW_KB", 16*1024)), "单个逻辑连接的 yamux 接收窗口大小（KB），需与服务端 YAMUX_WINDOW_KB 保持数量级一致；调大能提升大文件传输吞吐，但会增加内存占用")
+	flag.Int64Var(&yamuxWindowKB, "yamux-window-kb", int64(envInt64("YAMUX_WINDOW_KB", 30*1024)), "单个逻辑连接的 yamux 接收窗口大小（KB），需与服务端 YAMUX_WINDOW_KB 保持数量级一致；调大能提升大文件传输吞吐，但会增加内存占用")
 	flag.BoolVar(&cfg.PreferIPv6, "prefer-ipv6", envBool("PREFER_IPV6", true), "域名双栈解析时优先走 IPv6，IPv4 延迟兜底；设为 false 退回 Go 默认的 Happy Eyeballs")
 	flag.IntVar(&cfg.IPv4FallbackDelayMS, "ipv4-fallback-delay-ms", int(envInt64("IPV4_FALLBACK_DELAY_MS", 100)), "IPv6 拨号多久后才尝试 IPv4 兜底（毫秒），IPv6 提前失败时不受此限制、立刻兜底")
 	flag.StringVar(&cfg.YamuxMode, "yamux-mode", envStr("YAMUX_MODE", "auto"), "服务端是否支持本项目的 WS+yamux 连接复用协议：auto（首次自动探测并记住结果，默认）/ yamux（强制开启，标准 VLESS-WS 服务端会连不上）/ legacy（强制关闭，退回一个 WS 连接对应一次请求，兼容任意标准 VLESS-WS 服务端）")
