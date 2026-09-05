@@ -37,6 +37,24 @@ func dialOnce(ctx context.Context, sm *sessionManager, uuid [16]byte, cmd byte, 
 		return nil, fmt.Errorf("open stream: %w", err)
 	}
 
+	// 【修复】给这次 VLESS 握手（写请求头 + 等响应头）设置一个明确的截止
+	// 时间。之前这里完全没有超时：dialCtx 只约束了上面 openStream 这一步，
+	// 一旦服务端那边目标连接卡住（黑洞网络/防火墙静默丢包不回 RST），下面
+	// 的 stream.Read 会无限期阻塞，跟 -dial-timeout-ms 配置的值完全脱节，
+	// 用户体感就是"卡住/连不上"，还会让这个 goroutine 和这个 stream 一直
+	// 占用资源不释放。yamux.Stream 实现了 net.Conn，支持 SetDeadline。
+	if dl, ok := dialCtx.Deadline(); ok {
+		_ = stream.SetDeadline(dl)
+	}
+	// 握手成功后必须清掉这个超时，否则会误伤后续正常的数据转发阶段
+	// （比如大文件下载耗时超过握手阶段的 DialTimeoutMS）。
+	handshakeOK := false
+	defer func() {
+		if handshakeOK {
+			_ = stream.SetDeadline(time.Time{})
+		}
+	}()
+
 	hdr, err := buildVlessHeader(uuid, cmd, targetAddr, targetPort)
 	if err != nil {
 		stream.Close()
@@ -68,6 +86,7 @@ func dialOnce(ctx context.Context, sm *sessionManager, uuid [16]byte, cmd byte, 
 			return nil, fmt.Errorf("parse vless response: %w", perr)
 		}
 		leftover := respBuf[headerLen:]
+		handshakeOK = true
 		return &prefixConn{Conn: stream, prefix: leftover}, nil
 	}
 }
@@ -185,30 +204,42 @@ func dialWithProtocolDetection(ctx context.Context, sm *sessionManager, log *Log
 	}
 
 	// 这里不能一看到探测失败就直接判定为 legacy——"没拿到 VLESS 响应"
-	// 至少有两种完全不同的原因：
-	//   1. 服务端根本不认识 yamux 封装（把 yamux 帧当成 VLESS 头解析，
-	//      鉴权失败后直接把整条 WS 连接断掉）——这才是真正的协议不兼容；
-	//   2. 服务端认识 yamux、鉴权也通过了，只是这次探测请求要连的目标
-	//      恰好连不上（DNS 失败、目标拒绝连接等），服务端按 VLESS 协议
-	//      正常行为只关闭这一个 stream，底层 WS+yamux 会话本身完好无损。
-	//      这只是一次普通的目标连接失败，跟协议兼不兼容毫无关系，绝不能
-	//      因为这个就误判成 legacy——现实中"探测请求刚好连了个当时不通的
-	//      目标"太常见了（比如用户第一个请求访问的网站恰好临时不可达）。
+	// 至少有三种完全不同的原因，必须严格区分：
 	//
-	// 区分方法：看底层 yamux 会话在这次失败后是否还存活。只有真的连
-	// 协议都解析不了的服务端，才会让服务端直接掐断整条 WS 连接、导致
-	// 会话本身也跟着挂掉；单纯目标连接失败只会让服务端关闭这一个 stream，
-	// 会话本身还是健康的。
+	//   1.【纯网络问题，跟协议完全无关】探测这一次的 TCP 连接 / TLS 握手 /
+	//      WS Upgrade 本身就没成功（DNS 抖动、连接超时、TLS 握手失败、
+	//      中间设备瞬时丢包……）。这种情况下 sm.current 根本没被赋值过
+	//      （dialSession 只有握手成功才会设置它），如果误判成 legacy 并
+	//      永久缓存下去，而服务端其实完全支持 yamux 只是不支持 legacy，
+	//      就会导致【这个客户端进程之后所有请求永久失败】——这正是
+	//      "网络正常、服务器正常，但偶尔连不上"的根本原因，必须原样把
+	//      这次网络错误返回、不缓存任何结论，让下一次请求重新探测。
+	//   2.【服务端认识 yamux，只是这次目标偶发不通】WS+yamux 会话已经
+	//      建立成功，只是这次探测请求要连的目标恰好连不上（DNS 失败、
+	//      目标拒绝连接等），服务端按 VLESS 协议正常行为只关闭这一个
+	//      stream，底层会话本身完好无损——判定为 yamux。
+	//   3.【真正的协议不兼容】WS 已经建立成功，但对端把 yamux 帧当成
+	//      别的东西解析失败，直接把整条 WS 连接掐断，导致底层会话本身
+	//      也跟着挂掉——只有这种情况才能判定为 legacy。
 	sm.mu.Lock()
-	sessAlive := sm.current != nil && !sm.current.IsClosed()
+	sess := sm.current
 	sm.mu.Unlock()
 
-	if sessAlive {
+	if sess == nil {
+		// 对应情况 1：连 WS 都没建立成功，保持 modeUnknown，不缓存任何
+		// 结论，直接把这次网络错误原样返回给调用方。
+		log.Debug(fmt.Sprintf("探测阶段底层 WS 连接未建立成功（%s），这是网络问题而非协议不兼容，保持自动探测状态，下次请求会重新尝试", err.Error()))
+		return nil, err
+	}
+
+	if !sess.IsClosed() {
+		// 对应情况 2
 		sm.setModeAndCleanup(modeYamux)
 		log.Debug(fmt.Sprintf("探测请求本身失败（%s），但底层会话仍然存活，判定服务端支持连接复用协议，仅这次目标连接失败", err.Error()))
 		return nil, err
 	}
 
+	// 对应情况 3
 	log.Warn(fmt.Sprintf("连接复用协议探测失败且底层连接被对端整体断开（%s），判定为标准 VLESS-WS 服务端，自动切换为兼容模式", err.Error()))
 	sm.setModeAndCleanup(modeLegacy)
 	return dialVlessLegacyWithRetry(ctx, sm.cfg, log, uuid, cmd, targetAddr, targetPort)
