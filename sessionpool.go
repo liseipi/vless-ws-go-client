@@ -105,9 +105,17 @@ func (m *sessionManager) openStream(ctx context.Context) (net.Conn, error) {
 	}
 
 	m.mu.Lock()
-	// 简化并发处理：直接覆盖为最新会话。极端并发下可能短暂多建 1~2 条
-	// 会话，旧会话不会再被取用，之后随进程正常关闭；如需严格单例可在这里
-	// 判断 m.current 是否已被其它 goroutine 抢先替换后 Close 掉多余的一条。
+	// 【修复】之前这里无条件覆盖 m.current，极端并发下多建出来的会话既不会
+	// 被使用也不会被关闭——一直挂着占用服务端一条 WS 连接直到整个客户端
+	// 进程退出，属于资源泄漏。现在判断一下：如果这段时间内已经有其它
+	// goroutine 建好了一条仍然可用的会话，就用那条、把自己刚建的这条关掉；
+	// 否则才用自己这条替换 m.current。
+	if m.current != nil && !m.current.IsClosed() {
+		existing := m.current
+		m.mu.Unlock()
+		_ = newSess.Close()
+		return existing.OpenStream()
+	}
 	m.current = newSess
 	m.mu.Unlock()
 
@@ -147,7 +155,15 @@ func (m *sessionManager) dialSession(ctx context.Context) (*yamux.Session, error
 	if ka := time.Duration(cfg.KeepAliveSec) * time.Second; ka > 0 {
 		ymCfg.KeepAliveInterval = ka
 	}
-	ymCfg.ConnectionWriteTimeout = 15 * time.Second
+	// keepalive ping 等待确认的最长时间，超时会判定整条底层连接已死，直接
+	// 关闭该连接上复用的【所有】stream。之前这里写死 15 秒，配合较大的
+	// MaxStreamWindowSize 在高延迟/突发大流量场景下有一定概率被误触发，
+	// 导致一次普通抖动打断所有并发请求。现在改成可配置
+	// （-yamux-write-timeout-ms），需要和服务端 YAMUX_WRITE_TIMEOUT_MS
+	// 配合调整（两边各自独立生效，不要求相等）。
+	if wt := time.Duration(cfg.YamuxWriteTimeoutMS) * time.Millisecond; wt > 0 {
+		ymCfg.ConnectionWriteTimeout = wt
+	}
 	// yamux 默认单流窗口只有 256KB，会严重限制单个 stream（比如一次大文件
 	// 下载/上传）的吞吐量：发送方发满 256KB 未确认数据就必须停下来等对端
 	// 的窗口更新包，相当于每 256KB 就插入一次往返等待，RTT 越高影响越大。
